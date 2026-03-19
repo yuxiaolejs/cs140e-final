@@ -1,0 +1,1214 @@
+
+  CS140E Final Project -- Kernel Structure Overview
+  ==================================================
+  Tianle Yu | Winter 2026 | Stanford University
+
+
+                        +=============================================+
+                        |              BOOT SEQUENCE                  |
+                        |  notmain() in main.c                        |
+                        +=============================================+
+                                          |
+             +----------------------------+----------------------------+
+             |            |               |              |             |
+             v            v               v              v             v
+       +-----------+ +---------+  +------------+  +-----------+  +---------+
+       | kalloc    | | IRQ     |  | TTY + USB  |  | Framebuf  |  | eMMC +  |
+       | _init()   | | table + |  | keyboard   |  | init      |  | FAT32   |
+       | heap      | | stacks  |  | init       |  | (8x16     |  | init    |
+       | setup     | | setup   |  |            |  |  font)    |  |         |
+       +-----------+ +---------+  +------------+  +-----------+  +---------+
+             |            |               |              |             |
+             +----------------------------+----------------------------+
+                                          |
+                                          v
+                                  +---------------+
+                                  |  MMU init     |
+                                  |  L1 page tbl  |
+                                  |  enable MMU   |
+                                  +---------------+
+                                          |
+                                          v
+                                  +---------------+
+                                  |  exec("SH")   |
+                                  |  load shell   |
+                                  |  enter user   |
+                                  +---------------+
+
+
+  ========================================================================
+                         KERNEL MODULE MAP
+  ========================================================================
+
+  +-----------------------------------------------------------------------+
+  |                         KERNEL  (final/)                              |
+  |                                                                       |
+  |  +--------------------+    +--------------------+    +--------------+ |
+  |  |    SCHEDULER       |    |   VIRTUAL MEMORY   |    |  SYSCALLS    | |
+  |  |    sched.c/.h      |    |   vm.c/.h          |    |  syscall.c   | |
+  |  |                    |    |                    |    |              | |
+  |  | - FIFO ready_q     |    | - L1/L2 page tbls  |    | - 30+ Linux  | |
+  |  | - sleeping_q       |    | - User/Kernel map  |    |   ARM EABI   | |
+  |  | - rpi_thread_t PCB |    | - fork_page_table  |    |   syscalls   | |
+  |  | - preemptive sched |    | - demand paging    |    | - SVC #0     | |
+  |  | - timer-driven     |    | - 3GB user / 1GB K |    |   dispatch   | |
+  |  +--------------------+    +--------------------+    +--------------+ |
+  |                                                                       |
+  |  +--------------------+    +--------------------+    +--------------+ |
+  |  |   ELF LOADER       |    |  FILE DESCRIPTORS  |    |    TTY       | |
+  |  |   elf.c/.h         |    |  fd.c/.h           |    |  tty.c/.h    | |
+  |  |                    |    |                    |    |              | |
+  |  | - ARM 32-bit ELF   |    | - 64 FDs per proc  |    | - 128B bufs  | |
+  |  | - PT_LOAD segments |    | - struct file_ops  |    | - termios    | |
+  |  | - auxv setup       |    | - open/read/write  |    | - canonical  | |
+  |  | - stack init       |    |   close/seek/ioctl |    | - echo mode  | |
+  |  | - cache sync       |    | - refcount tracking|    | - USB keybd  | |
+  |  +--------------------+    +--------------------+    +--------------+ |
+  |                                                                       |
+  |  +--------------------+    +--------------------+    +--------------+ |
+  |  |   INTERRUPTS       |    |   KUSER PAGE       |    |   PROCESS    | |
+  |  |   int.c/.h         |    |   kuser.c/.h       |    |   MGMT       | |
+  |  |                    |    |                    |    |              | |
+  |  | - Timer IRQ        |    | - @ 0xFFFF0000     |    | - fork()     | |
+  |  | - GPIO IRQ         |    | - get_tls()        |    | - vfork()    | |
+  |  | - Prefetch abort   |    | - cmpxchg()        |    | - exec()     | |
+  |  | - Data abort       |    | - memory_barrier() |    | - exit()     | |
+  |  | - SVC handler      |    |                    |    | - waitpid()  | |
+  |  +--------------------+    +--------------------+    +--------------+ |
+  |                                                                       |
+  +-----------------------------------------------------------------------+
+          |                        |                        |
+          v                        v                        v
+  +-----------------------------------------------------------------------+
+  |                   HARDWARE ABSTRACTION LAYER  (lib/)                  |
+  |                                                                       |
+  |  +----------+ +--------+ +--------+ +-------+ +------+ +-----------+  |
+  |  |  serial  | |  gpio  | |  emmc  | | pifat | | piusb| |    fb     |  |
+  |  |  UART    | |  pins  | |  SD    | | FAT32 | | USB  | | display   |  |
+  |  +----------+ +--------+ +--------+ +-------+ +------+ +-----------+  |
+  |  +----------+ +--------+ +--------+ +-------+                         |
+  |  |  cstr    | |  mem   | | pictl  | | regs  |                         |
+  |  |  string  | | alloc  | | RPi    | | ARM   |                         |
+  |  |  utils   | | kfree  | | ctrl   | | regs  |                         |
+  |  +----------+ +--------+ +--------+ +-------+                         |
+  +-----------------------------------------------------------------------+
+          |                        |                        |
+          v                        v                        v
+  +-----------------------------------------------------------------------+
+  |                     BARE METAL HARDWARE                               |
+  |                                                                       |
+  |    BCM2835 SoC  |  ARM1176JZF-S  |  eMMC/SD  |  USB  |  GPIO          |
+  |    (Raspberry Pi)                                                     |
+  +-----------------------------------------------------------------------+
+
+
+  ========================================================================
+                    SCHEDULER DETAIL (FIFO + Preemptive)
+  ========================================================================
+
+       Timer IRQ fires
+            |
+            v
+    +-------------------+
+    |  tick_try_to_     |        +---> [Thread A] ---> [Thread B] ---> ...
+    |  wake_up()        |        |         ready_q (FIFO)
+    |  check sleeping_q |        |
+    +-------------------+        |
+            |                    |
+            v                    |
+    +--------------------+       |
+    |  cs_do_sched()     |-------+
+    |  save cur context  |
+    |  pick next thread  |
+    |  restore context   |
+    |  switch page table |
+    |  set TLS base      |
+    +--------------------+
+
+    Thread PCB (rpi_thread_t):
+    +---------------------------+
+    | tid        (thread ID)    |
+    | ctx        (saved regs)   |
+    | l1_pt      (page table)   |
+    | brk/brk_min (heap range)  |
+    | fdt[64]    (file descrs)  |
+    | cwd        (work dir)     |
+    | tls_base   (TLS pointer)  |
+    | status     (run/sleep/    |
+    |             exit/zombie)  |
+    +---------------------------+
+
+
+  CS140E Final Project -- User Space Design
+  ==========================================
+  Tianle Yu | Winter 2026 | Stanford University
+
+
+  ========================================================================
+                    USER-KERNEL BOUNDARY & SYSCALL FLOW
+  ========================================================================
+
+   USER SPACE (unprivileged, ARM User Mode)
+  +----------------------------------------------------------------------+
+  |                                                                      |
+  |   User Program (e.g. SH.ELF, TinyCC, hw.c ...)                       |
+  |        |                                                             |
+  |        | C library (glibc / raw asm)                                 |
+  |        |                                                             |
+  |        v                                                             |
+  |   +---------------------------+                                      |
+  |   |  r7 = syscall number      |   Linux ARM EABI convention:         |
+  |   |  r0..r5 = arguments       |   syscall # in r7, args in r0-r5     |
+  |   |  SVC #0                   |   return value in r0                 |
+  |   +---------------------------+                                      |
+  |               |                                                      |
+  +----------------------------------------------------------------------+
+                  | (trap to SVC mode)
+                  v
+  ========================================================================
+   KERNEL SPACE (privileged, ARM SVC Mode)
+  +----------------------------------------------------------------------+
+  |                                                                      |
+  |   +----------------------------+                                     |
+  |   |  SVC Exception Handler     |                                     |
+  |   |  save user context         |                                     |
+  |   |  read r7 (syscall number)  |                                     |
+  |   +----------------------------+                                     |
+  |               |                                                      |
+  |               v                                                      |
+  |   +----------------------------+                                     |
+  |   |    SYSCALL DISPATCH        |                                     |
+  |   |    switch(r7)              |                                     |
+  |   +----------------------------+                                     |
+  |     |    |    |    |    |    |                                       |
+  |     v    v    v    v    v    v                                       |
+  |   +----+----+----+----+----+----+----+----+----+----+----+           |
+  |   |exit|read|writ|open|clos|brk |exec|fork|wait|dup |... |           |
+  |   | 1  | 3  | 4  | 5  | 6  | 45 | 11 |120 | 7  | 41 |    |           |
+  |   +----+----+----+----+----+----+----+----+----+----+----+           |
+  |               |                                                      |
+  |               v                                                      |
+  |   +----------------------------+                                     |
+  |   |  return to user mode       |                                     |
+  |   |  restore context           |                                     |
+  |   |  result in r0              |                                     |
+  |   +----------------------------+                                     |
+  |                                                                      |
+  +----------------------------------------------------------------------+
+
+
+  ========================================================================
+                 FILE DESCRIPTOR SUBSYSTEM
+  ========================================================================
+
+  Per-Process File Descriptor Table (max 64 entries)
+  ==================================================
+
+  fdt[0]  --->  struct file { ops: &tty_ops,  priv: &tty_state }  (stdin)
+  fdt[1]  --->  struct file { ops: &tty_ops,  priv: &tty_state }  (stdout)
+  fdt[2]  --->  struct file { ops: &tty_ops,  priv: &tty_state }  (stderr)
+  fdt[3]  --->  struct file { ops: &mount_ops, priv: &open_file }  (opened file)
+  fdt[4]  --->  NULL  (unused)
+   ...
+  fdt[63] --->  NULL  (unused)
+
+
+  struct file                        struct file_ops
+  +------------------+               +-------------------+
+  | refcnt           |               | .read()           |
+  | flags (O_RDONLY  |   -------->   | .write()          |
+  |        O_WRONLY  |               | .ioctl()          |
+  |        O_RDWR)   |               | .lseek()          |
+  | pos (offset)     |               | .close()          |
+  | *priv (backing)  |               | .fcntl()          |
+  | *ops  (dispatch) |               +-------------------+
+  +------------------+
+
+
+  Two Backends:
+  =============
+
+    TTY Backend (fds 0,1,2)            FAT32 Backend (opened files)
+   +-------------------------+        +-------------------------+
+   |  tty_read()             |        |  mount_read()           |
+   |    blocks until \n      |        |    pifat read           |
+   |    (canonical mode)     |        |                         |
+   |                         |        |  mount_write()          |
+   |  tty_write()            |        |    pifat write          |
+   |    UART + framebuffer   |        |                         |
+   |                         |        |  mount_lseek()          |
+   |  tty_ioctl()            |        |    file position        |
+   |    TCGETS/TCSETS        |        |                         |
+   |    termios control      |        |  mount_fstatat64()      |
+   |                         |        |    file attributes      |
+   |  Input: USB keyboard    |        |                         |
+   |    --> tty_system_      |        |  mount_get_dirents64()  |
+   |        tty_input()      |        |    directory listing    |
+   +-------------------------+        +-------------------------+
+              ^                                  ^
+              |                                  |
+         USB keyboard                     eMMC / SD card
+         (lib/piusb)                     (lib/emmc + pifat)
+
+
+  ========================================================================
+                       TTY SUBSYSTEM DETAIL
+  ========================================================================
+
+                    USB Keyboard
+                         |
+                         v
+              +---------------------+
+              | tty_system_tty_     |
+              | input(char c)       |
+              +---------------------+
+                         |
+                         v
+              +---------------------+
+              |   Input Buffer      |  <--- 128 bytes circular
+              |   [a][b][c][\n]...  |
+              +---------------------+
+                         |
+                         | (on timer tick: tty_system_process_tty)
+                         v
+              +---------------------+
+              |   tty_read()        |
+              |   blocks in canon   |
+              |   mode until \n     |
+              +---------------------+
+                         |
+                         v
+                  user buffer (r1)
+
+
+              User write(fd, buf, n)
+                         |
+                         v
+              +---------------------+
+              |   tty_write()       |
+              +---------------------+
+                    |           |
+                    v           v
+              +---------+  +---------+
+              |  UART   |  | Frame   |
+              | serial  |  | buffer  |
+              | output  |  | display |
+              +---------+  +---------+
+
+
+  ========================================================================
+             TERMIOS (Terminal Line Discipline)
+  ========================================================================
+
+  termios_t
+  +--------------------------+
+  | c_iflag   (input flags)  |   ICRNL: \r -> \n
+  | c_oflag   (output flags) |   OPOST: post-processing
+  | c_cflag   (ctrl flags)   |   baud, char size
+  | c_lflag   (local flags)  |   ECHO: echo input
+  |                          |   ICANON: line-buffered
+  |                          |   ISIG: signal chars
+  | c_cc[]    (special chars)|   VEOF, VERASE, VINTR...
+  +--------------------------+
+
+     ioctl(fd, TCGETS, &t)   -->  read terminal settings
+     ioctl(fd, TCSETS, &t)   -->  write terminal settings
+
+
+  ========================================================================
+           FAT32 FILESYSTEM (eMMC / SD Card)
+  ========================================================================
+
+     openat(AT_FDCWD, "HW.ELF", O_RDONLY)
+              |
+              v
+     +---------------------------+
+     |  mount_openat()           |
+     |  translate to FAT 8.3     |   "hw.elf" -> "HW      ELF"
+     |  lookup in directory      |
+     |  allocate struct file     |
+     |  set ops = mount_ops      |
+     +---------------------------+
+              |
+              v
+     +---------------------------+
+     | struct open_file_priv     |
+     | +-- fat_dirent_t *dirent  |   points to FAT directory entry
+     | +-- fat_dirent_t *parent  |   for relative lookups
+     +---------------------------+
+
+     File I/O:
+       read(fd, buf, n)   -->  mount_read()   -->  pifat_read()
+       write(fd, buf, n)  -->  mount_write()  -->  pifat_write()
+       lseek(fd, off, w)  -->  mount_lseek()
+
+     Directory listing:
+       getdents64(fd, buf, n)  -->  mount_get_dirents64()
+
+
+  CS140E Final Project -- User Programs Ported
+  ==============================================
+  Tianle Yu | Winter 2026 | Stanford University
+
+
+  ========================================================================
+              USER PROGRAM ECOSYSTEM OVERVIEW
+  ========================================================================
+
+                        +------------------------------------------+
+                        |              SD Card (FAT32)             |
+                        |                                          |
+                        |  SH.ELF      (shell - initial process)   |
+                        |  HW.ELF      (hello world w/ glibc)      |
+                        |  BHW.ELF     (bare hello, raw syscalls)  |
+                        |  TEST.ELF    (minimal syscall test)      |
+                        |  RPK.ELF     (kernel replacer tool)      |
+                        |  BLK.ELF     (GPIO blinker test)         |
+                        |  TCC.ELF     (TinyCC compiler!)          |
+                        |                                          |
+                        +------------------------------------------+
+                                       |
+                                       | exec("SH.ELF")
+                                       v
+                        +------------------------------------------+
+                        |          KERNEL (ELF Loader)             |
+                        |  1. Read ELF from FAT32                  |
+                        |  2. Validate (ARM 32-bit LE)             |
+                        |  3. Map PT_LOAD segments                 |
+                        |  4. Setup stack + auxv                   |
+                        |  5. Jump to entry point                  |
+                        +------------------------------------------+
+                                       |
+                                       v
+                        +------------------------------------------+
+                        |          USER MODE EXECUTION             |
+                        +------------------------------------------+
+
+
+  ========================================================================
+        PROGRAM DETAIL: COMPLEXITY SPECTRUM
+  ========================================================================
+
+    Bare Metal                                         Full C Library
+    (raw asm)                                          (glibc linked)
+    <-------------------------------------------------------------->
+
+    test.c         bhw.c          blk.c      rpk.c      hw.c    TinyCC
+      |              |              |          |          |        |
+      v              v              v          v          v        v
+   +--------+   +---------+   +--------+  +--------+ +------+ +------+
+   | inline |   | syscall |   | GPIO + |  | custom | | std  | | full |
+   | asm    |   | wrapper |   | basic  |  | SVC #3 | | print| | C    |
+   | SVC #0 |   | macros  |   | I/O    |  | kernel | | puts | | comp |
+   | only   |   | no libc |   |        |  | replace| | etc  | | iler |
+   +--------+   +---------+   +--------+  +--------+ +------+ +------+
+
+
+  ========================================================================
+           1. test.c -- Minimal Syscall Test
+  ========================================================================
+
+  Purpose: Proves the syscall interface works at the lowest level.
+           No libraries. Pure inline assembly.
+
+  +--------------------------------------------------+
+  |  test.c                                          |
+  |                                                  |
+  |  _start:                                         |
+  |    mov r7, #4        ; SYS_write                 |
+  |    mov r0, #1        ; fd = stdout               |
+  |    ldr r1, =msg      ; buf = "Hello World\n"     |
+  |    mov r2, #12       ; len = 12                  |
+  |    svc #0            ; trap to kernel            |
+  |                                                  |
+  |    mov r7, #1        ; SYS_exit                  |
+  |    mov r0, #0        ; status = 0                |
+  |    svc #0            ; trap to kernel            |
+  |                                                  |
+  |  msg: .ascii "Hello World\n"                     |
+  +--------------------------------------------------+
+       |
+       | SVC #0 (r7=4)
+       v
+  +--------------------------------------------------+
+  |  Kernel: syscall dispatch                        |
+  |    case 4 (write):                               |
+  |      fd=1 -> tty_write(buf, 12)                  |
+  |        -> UART output                            |
+  |        -> Framebuffer output                     |
+  +--------------------------------------------------+
+       |
+       v
+     "Hello World\n" on serial + display
+
+
+  ========================================================================
+           2. bhw.c -- Bare Hello World
+  ========================================================================
+
+  Purpose: Hello world using C with syscall wrapper macros.
+           Still no standard library. Demonstrates the syscall3 pattern.
+
+  +--------------------------------------------------+
+  |  bhw.c                                           |
+  |                                                  |
+  |  #define syscall3(num, a, b, c)                  |
+  |    register int r7 asm("r7") = (num);            |
+  |    register int r0 asm("r0") = (a);              |
+  |    register int r1 asm("r1") = (b);              |
+  |    register int r2 asm("r2") = (c);              |
+  |    asm volatile("svc #0" : ...);                 |
+  |                                                  |
+  |  void _start() {                                 |
+  |    syscall3(4, 1, "Hello!\n", 7);  // write      |
+  |    syscall1(1, 0);                 // exit       |
+  |  }                                               |
+  +--------------------------------------------------+
+
+  Build: arm-linux-gnueabi-gcc -nostdlib -static -o BHW.ELF bhw.c
+
+
+  ========================================================================
+           3. hw.c -- Hello World (with glibc)
+  ========================================================================
+
+  Purpose: Standard C program linked against glibc.
+           Tests that the kernel's syscall interface is Linux-compatible
+           enough for real C library programs.
+
+  +--------------------------------------------------+
+  |  hw.c                                            |
+  |                                                  |
+  |  #include <stdio.h>                              |
+  |                                                  |
+  |  int main() {                                    |
+  |      printf("Hello, World!\n");                  |
+  |      return 0;                                   |
+  |  }                                               |
+  +--------------------------------------------------+
+
+  Call chain:
+    printf("Hello, World!\n")
+      -> glibc internal buffering
+        -> write(1, buf, n)            // libc calls SYS_write
+          -> SVC #0, r7=4
+            -> kernel tty_write()
+              -> UART + framebuffer
+
+  This program also exercises:
+    - brk() for heap (glibc malloc)
+    - set_tls() for thread-local storage (errno, etc.)
+    - writev() for scatter-gather I/O
+    - ioctl() for terminal queries
+    - auxv parsing (AT_PHDR, AT_PAGESZ, etc.)
+
+
+  ========================================================================
+           4. rpk.c -- Kernel Replacer
+  ========================================================================
+
+  Purpose: Hot-swap the running kernel with a new one from SD card.
+           Uses a custom SVC #3 to trigger kernel replacement.
+
+  +--------------------------------------------------+
+  |  rpk.c                                           |
+  |                                                  |
+  |  int main(int argc, char **argv) {               |
+  |      // argv[1] = filename                       |
+  |      // argv[2] = load address                   |
+  |      asm volatile(                               |
+  |          "mov r0, %0\n"                          |
+  |          "mov r1, %1\n"                          |
+  |          "svc #3\n"   // custom: replace kernel  |
+  |          :: "r"(filename), "r"(addr)             |
+  |      );                                          |
+  |  }                                               |
+  +--------------------------------------------------+
+
+  Flow:
+    rpk NEWKRNL.BIN 0xC0008000
+         |
+         v
+    SVC #3 handler in kernel
+         |
+         v
+    +-------------------------------+
+    | 1. Open file from FAT32       |
+    | 2. Read into memory at addr   |
+    | 3. Jump to new kernel entry   |
+    | 4. Old kernel is gone!        |
+    +-------------------------------+
+
+
+  ========================================================================
+           5. blk.c -- GPIO Blinker + Test
+  ========================================================================
+
+  Purpose: Test GPIO access and basic I/O from user space.
+
+  +--------------------------------------------------+
+  |  blk.c                                           |
+  |                                                  |
+  |  // GPIO pin toggling (attempted)                |
+  |  // + Hello World output                         |
+  |  // Tests that user-space can do basic I/O       |
+  +--------------------------------------------------+
+
+
+  ========================================================================
+           6. TinyCC -- C Compiler (The Big One!)
+  ========================================================================
+
+  Purpose: A full C compiler running in user space on the Pi.
+           Enables on-device compilation -- write C, compile, run,
+           all without a host machine.
+
+  +--------------------------------------------------+
+  |                                                  |
+  |              TinyCC (tcc)                        |
+  |         Complete C Compiler Port                 |
+  |                                                  |
+  |  Source: userland/tinycc/                        |
+  |  Output: TCC.ELF                                 |
+  |                                                  |
+  +--------------------------------------------------+
+
+  What TinyCC exercises in the kernel:
+
+  +--------------------+--------------------------------------------+
+  | Kernel Feature     | How TinyCC Uses It                         |
+  +--------------------+--------------------------------------------+
+  | brk / sbrk         | Dynamic memory allocation for AST,         |
+  |                    | symbol tables, code generation buffers     |
+  +--------------------+--------------------------------------------+
+  | read / write       | Reading source files, writing output       |
+  +--------------------+--------------------------------------------+
+  | openat / close     | Opening .c source files and headers        |
+  +--------------------+--------------------------------------------+
+  | lseek              | Navigating within source/output files      |
+  +--------------------+--------------------------------------------+
+  | fstatat64          | Checking file existence and size           |
+  +--------------------+--------------------------------------------+
+  | getdents64         | Scanning include directories               |
+  +--------------------+--------------------------------------------+
+  | mmap (via brk)     | Large allocations for code output          |
+  +--------------------+--------------------------------------------+
+  | TLS / set_tls      | glibc thread-local storage (errno etc.)    |
+  +--------------------+--------------------------------------------+
+  | execve             | Could potentially exec compiled binaries   |
+  +--------------------+--------------------------------------------+
+
+  Self-hosting dream:
+
+    +----------+      +---------+      +---------+
+    | hello.c  | ---> |  TCC    | ---> | HELLO   |
+    | (on SD)  |      | (on Pi) |      | .ELF    |
+    +----------+      +---------+      +---------+
+                          |
+                    runs entirely
+                    on the Pi!
+
+
+  ========================================================================
+           BUILD PIPELINE (Host -> SD Card -> Pi)
+  ========================================================================
+
+  Host Machine (x86)                       Raspberry Pi (ARM)
+  +---------------------------+            +---------------------------+
+  |                           |            |                           |
+  | arm-linux-gnueabi-gcc     |            |  Kernel boots from SD     |
+  |   cross-compile user      |            |                           |
+  |   programs for ARM        |   SD Card  |  ELF loader reads from    |
+  |                           | =========> |  FAT32 filesystem         |
+  | Produce:                  |            |                           |
+  |   HW.ELF                  |            |  exec("SH.ELF") starts    |
+  |   BHW.ELF                 |            |  the shell                |
+  |   TCC.ELF                 |            |                           |
+  |   SH.ELF                  |            |  Shell can exec() any     |
+  |   etc.                    |            |  .ELF on the SD card      |
+  |                           |            |                           |
+  +---------------------------+            +---------------------------+
+
+  Compiler flags for user programs:
+  +---------------------------------------------------------------+
+  | arm-linux-gnueabi-gcc -static -mcpu=arm1176jzf-s              |
+  |   -O -Wall -std=gnu99                                         |
+  |   hw.c -o HW.ELF          (with glibc, static linked)         |
+  |                                                               |
+  | arm-linux-gnueabi-gcc -nostdlib -static -mcpu=arm1176jzf-s    |
+  |   bhw.c -o BHW.ELF        (bare, no libc)                     |
+  +---------------------------------------------------------------+
+
+
+  CS140E Final Project -- Memory Layout & Virtual Memory
+  =======================================================
+  Tianle Yu | Winter 2026 | Stanford University
+
+
+  ========================================================================
+             VIRTUAL ADDRESS SPACE (per-process view)
+  ========================================================================
+
+  0xFFFF0000  +---------------------------+  <-- kuser helper page
+              | kuser_get_tls()           |      (mapped into every process)
+              | kuser_cmpxchg()           |
+              | kuser_memory_barrier()    |
+              +---------------------------+
+
+              |                           |
+              |     (unmapped gap)        |
+              |                           |
+
+  0xC0008000  +---------------------------+  <-- Kernel code + data
+              |                           |      (identity mapped)
+              | Kernel .text, .data, .bss |
+              | Kernel heap (kalloc)      |
+              | Page tables               |
+              | Thread PCBs               |
+              |                           |
+  0xC0000000  +===========================+  <-- KERNEL / USER BOUNDARY
+              |                           |
+              |     (guard region)        |
+              |                           |
+  0xBFFFFFF0  +---------------------------+  <-- STACK_TOP
+              |         |                 |      (grows downward)
+              |         | User Stack      |
+              |         v                 |      10 pages = 40KB
+              |                           |
+              +---------------------------+
+              |                           |
+              |                           |
+              |     (unmapped gap)        |
+              |     available for         |
+              |     future growth         |
+              |                           |
+              +---------------------------+
+              |         ^                 |
+              |         | User Heap       |      grows upward via brk()
+              |         |                 |
+  brk ------->+---------------------------+
+              |                           |
+              |     .bss  (zeroed)        |
+              |     .data (initialized)   |
+              |     .rodata (constants)   |
+              |     .text  (code)         |
+              |                           |
+  0x00010000  +---------------------------+  <-- Typical ELF load address
+  (varies)    |                           |
+              |                           |
+  0x00000000  +---------------------------+
+
+
+  ========================================================================
+              KERNEL PHYSICAL MEMORY MAP (Identity Mapped)
+  ========================================================================
+
+  Physical Address:
+
+  0xFFFF0000  +---------------------------+
+              | kuser page                |
+              +---------------------------+
+
+  0x40000000  +---------------------------+
+              | BCM2835 Peripherals       |
+              | (GPIO, UART, Timer,       |
+              |  eMMC, USB, Framebuffer)  |
+  0x20000000  +---------------------------+
+
+              |                           |
+              | Available RAM             |
+              | (kernel heap, page alloc) |
+              |                           |
+
+  0xC0008000  +---------------------------+
+              | Kernel loaded here        |
+              | (by GPU bootloader)       |
+  0xC0000000  +---------------------------+
+
+              |  ... more RAM ...         |
+
+  0x00000000  +---------------------------+
+              | Exception vector table    |
+              | (first 32 bytes)          |
+              +---------------------------+
+
+
+  ========================================================================
+            TWO-LEVEL PAGE TABLE STRUCTURE (ARMv6)
+  ========================================================================
+
+                          L1 Page Table
+                       (4096 entries, 16KB)
+                     each entry covers 1MB
+
+   Index:  [   0   |   1   |   2   | ... | 3071  | 3072  | ... | 4095  ]
+           +-------+-------+-------+-----+-------+-------+-----+-------+
+           | L2 ptr| L2 ptr| L2 ptr| ... | L2 ptr| 1MB   | ... | 1MB   |
+           | user  | user  | user  |     | user  | sect  |     | sect  |
+           +-------+-------+-------+-----+-------+-------+-----+-------+
+               |       |                           |
+               |       |    (entries 0-3071:        (entries 3072-4095:
+               |       |     user space,             kernel space,
+               |       |     L2 coarse PTEs)         1MB section maps,
+               v       v                             identity mapped)
+
+           L2 Page Table              L2 Page Table
+         (256 entries, 1KB)         (256 entries, 1KB)
+        each entry covers 4KB      each entry covers 4KB
+
+        +------+------+---+         +------+------+---+
+        | 4KB  | 4KB  |...|         | 4KB  | 4KB  |...|
+        | page | page |   |         | page | page |   |
+        +------+------+---+         +------+------+---+
+           |      |                    |      |
+           v      v                    v      v
+        +------+ +------+          +------+ +------+
+        |phys  | |phys  |          |phys  | |phys  |
+        |page  | |page  |          |page  | |page  |
+        |frame | |frame |          |frame | |frame |
+        +------+ +------+          +------+ +------+
+
+
+  ========================================================================
+           L2 PAGE TABLE ENTRY FORMAT (Small Page, 4KB)
+  ========================================================================
+
+   31                  12 11  10 9  8  7  6  5  4  3  2  1  0
+  +----------------------+--+---+--+--+--+--+--+-----+--+----+
+  |   Physical Address   |nG|  S|APX|TEX |  | AP |  C | B| 1 0|
+  |   (bits 31:12)       |  |   |   |    |  |    |    |  |    |
+  +----------------------+--+---+--+--+--+--+--+-----+--+----+
+
+  Where:
+    Physical Address [31:12] : Page frame number
+    AP [5:4]                 : Access Permission bits
+    APX [9]                  : Access Permission Extension
+    C [3]                    : Cacheable
+    B [2]                    : Bufferable
+    [1:0] = 0b10            : Small page descriptor type
+
+  Permission encoding (AP + APX):
+  +-----+----+-----------------------------------+
+  | APX | AP | Permission                        |
+  +-----+----+-----------------------------------+
+  |  0  | 01 | SVC: R/W,  User: No access        |
+  |  0  | 10 | SVC: R/W,  User: Read-only        |
+  |  0  | 11 | SVC: R/W,  User: R/W              |
+  |  1  | 01 | SVC: R/O,  User: No access        |
+  |  1  | 10 | SVC: R/O,  User: Read-only        |
+  +-----+----+-----------------------------------+
+
+
+  ========================================================================
+            DEMAND PAGING & BRK (Heap Growth)
+  ========================================================================
+
+       User calls brk(new_brk)
+              |
+              v
+       +---------------------------+
+       |  sys_brk handler          |
+       |  if new_brk > current brk |
+       +---------------------------+
+              |
+              v
+       +---------------------------+
+       |  make_sure_user_space()   |
+       |  for each missing page:   |
+       +---------------------------+
+              |
+              v
+       +------+------+------+
+       |      |      |      |
+       v      v      v      v
+    +------+------+------+------+
+    |kalloc|kalloc|kalloc|kalloc|   Allocate physical pages
+    |4KB   |4KB   |4KB   |4KB   |
+    +------+------+------+------+
+       |      |      |      |
+       v      v      v      v
+    Map into L2 page table entries
+    with User R/W permissions
+              |
+              v
+    Update brk pointer in PCB
+              |
+              v
+    Return new brk to user
+
+
+  ========================================================================
+            PROCESS FORK -- PAGE TABLE DUPLICATION
+  ========================================================================
+
+    Parent Process                          Child Process
+
+    L1 Table (parent)                       L1 Table (child)
+    +---+---+---+---+                       +---+---+---+---+
+    | * | * | * |...|                       | * | * | * |...|  (new L1)
+    +---+---+---+---+                       +---+---+---+---+
+      |   |                                   |   |
+      v   v                                   v   v
+    L2    L2    (parent's)                  L2    L2    (new copies)
+    +--+  +--+                              +--+  +--+
+    |  |  |  |                              |  |  |  |
+    +--+  +--+                              +--+  +--+
+      |     |                                 |     |
+      v     v                                 v     v
+    Phys  Phys   (parent's pages)           Phys  Phys  (NEW copies!)
+    Page  Page                              Page  Page
+
+    fork_page_table():
+      1. Allocate new L1 table
+      2. Copy kernel mappings (shared, identity)
+      3. For each user L2 table:
+         a. Allocate new L2 table
+         b. For each valid L2 entry:
+            - Allocate NEW physical page
+            - Copy contents from parent page
+            - Map in child's L2
+      4. Return new L1 table pointer
+
+    Note: This is a FULL COPY, not copy-on-write.
+          Every user page is duplicated immediately.
+
+
+  ========================================================================
+            ELF LOADING -- MEMORY SETUP
+  ========================================================================
+
+    ELF File on SD Card
+    +------------------+
+    | ELF Header       |
+    |   e_entry        |----> entry point address
+    |   e_phoff        |----> program header offset
+    +------------------+
+    | Program Headers  |
+    |   PT_LOAD #1     |----> .text + .rodata  (R/X)
+    |   PT_LOAD #2     |----> .data + .bss     (R/W)
+    +------------------+
+    | Section data     |
+    |   .text bytes    |
+    |   .data bytes    |
+    +------------------+
+
+    Loading process:
+
+    For each PT_LOAD segment:
+    +-------------------------------------------------------+
+    |  1. vaddr = phdr.p_vaddr                              |
+    |  2. memsz = phdr.p_memsz                              |
+    |  3. filesz = phdr.p_filesz                            |
+    |                                                       |
+    |  4. make_sure_user_space(vaddr, vaddr + memsz)        |
+    |     (allocate pages, map in page table)               |
+    |                                                       |
+    |  5. memcpy(vaddr, file_data + p_offset, filesz)       |
+    |     (copy segment from ELF file)                      |
+    |                                                       |
+    |  6. memset(vaddr + filesz, 0, memsz - filesz)         |
+    |     (zero BSS portion)                                |
+    |                                                       |
+    |  7. clean_dcache_range + invalidate_icache            |
+    |     (ensure code is visible to instruction fetch)     |
+    +-------------------------------------------------------+
+
+    After loading, set up stack:
+
+    STACK_TOP (0xBFFFFFF0)
+    +---------------------------+
+    |  NULL (end of auxv)       |
+    |  AT_NULL, 0               |
+    |  AT_RANDOM, &16_bytes     |
+    |  AT_EXECFN, "PROG.ELF"    |
+    |  AT_ENTRY, entry_point    |
+    |  AT_PAGESZ, 4096          |
+    |  AT_PHNUM, phdr_count     |
+    |  AT_PHENT, phdr_size      |
+    |  AT_PHDR, phdr_addr       |
+    |  NULL (end of envp)       |
+    |  env strings...           |
+    |  NULL (end of argv)       |
+    |  argv[n-1]                |
+    |  ...                      |
+    |  argv[0]                  |
+    |  argc                     |  <-- SP points here
+    +---------------------------+
+
+
+  CS140E Final Project -- Interrupt Handling & Context Switching
+  ==============================================================
+  Tianle Yu | Winter 2026 | Stanford University
+
+
+  ========================================================================
+              ARM EXCEPTION / INTERRUPT FLOW
+  ========================================================================
+
+                     +-------------------+
+                     |  ARM1176JZF-S     |
+                     |  CPU Core         |
+                     +-------------------+
+                       |   |   |   |
+          +------------+   |   |   +------------+
+          |                |   |                |
+          v                v   v                v
+    +-----------+   +----------+----------+  +----------+
+    | Reset     |   | IRQ      | FIQ      |  | Undef    |
+    | 0x00      |   | 0x18     | 0x1C     |  | 0x04     |
+    +-----------+   +----------+----------+  +----------+
+                         |
+          +--------------+--------------+
+          |              |              |
+          v              v              v
+    +-----------+  +-----------+  +-----------+
+    | SVC       |  | Prefetch  |  | Data      |
+    | (syscall) |  | Abort     |  | Abort     |
+    | 0x08      |  | 0x0C      |  | 0x10      |
+    +-----------+  +-----------+  +-----------+
+
+
+  ========================================================================
+             TIMER IRQ PATH (Preemptive Scheduling)
+  ========================================================================
+
+    BCM2835 ARM Timer
+    (interval=0xFF, prescaler=16)
+            |
+            | IRQ fires
+            v
+    +-------------------------------+
+    | IRQ Exception Entry           |
+    | 1. Switch to IRQ mode         |
+    | 2. Save return address (LR)   |
+    | 3. Save SPSR                  |
+    +-------------------------------+
+            |
+            v
+    +-------------------------------+
+    | generic_irq_handler()         |
+    | Check IRQ pending registers:  |
+    |   Basic IRQ 0 = Timer?        |
+    |   IRQ 2 bit 17 = GPIO?        |
+    +-------------------------------+
+            |
+            +----- Timer IRQ? -----+
+            |                      |
+            v                      v
+    +-------------------+  +-------------------+
+    | Timer handler:    |  | GPIO handler:     |
+    | 1. Clear IRQ      |  | Handle GPIO event |
+    | 2. tty_system_    |  +-------------------+
+    |    process_tty()  |
+    | 3. tick_try_to_   |
+    |    wake_up()      |
+    | 4. cs_do_sched()  |
+    +-------------------+
+            |
+            v
+    +-------------------------------+
+    | cs_do_sched()                 |
+    | Context Switch Logic          |
+    +-------------------------------+
+            |
+            v
+    (see Context Switch detail below)
+
+
+  ========================================================================
+             SVC PATH (Syscall Entry)
+  ========================================================================
+
+    User code executes: SVC #0
+            |
+            v
+    +-------------------------------+
+    | SVC Exception Entry           |
+    | 1. Switch to SVC mode         |
+    | 2. Save user registers:       |
+    |    R0-R12, LR, SPSR           |
+    |    into saved_context_t       |
+    +-------------------------------+
+            |
+            v
+    +-------------------------------+
+    | Read syscall number from R7   |
+    | Read arguments from R0-R5     |
+    +-------------------------------+
+            |
+            v
+    +-------------------------------+
+    | Dispatch: switch(r7) {        |
+    |   case 1:  sys_exit()         |
+    |   case 3:  sys_read()         |
+    |   case 4:  sys_write()        |
+    |   case 11: sys_execve()       |
+    |   case 45: sys_brk()          |
+    |   case 120: sys_clone()       |
+    |   case 190: sys_vfork()       |
+    |   ...                         |
+    | }                             |
+    +-------------------------------+
+            |
+            v
+    +-------------------------------+
+    | Place return value in R0      |
+    | svc_generic_return()          |
+    |   Restore user context        |
+    |   MOVS PC, LR (return)        |
+    +-------------------------------+
+            |
+            v
+    User mode resumes, result in R0
+
+
+  ========================================================================
+             CONTEXT SWITCH DETAIL
+  ========================================================================
+
+    cs_do_sched()
+            |
+            v
+    +--------------------------------------+
+    | 1. Save current thread context       |
+    |    cur->ctx.sp  = current SP         |
+    |    cur->ctx.lr  = current LR         |
+    |    cur->ctx.pc  = return address     |
+    |    cur->ctx.cpsr = SPSR              |
+    |    cur->ctx.r0..r12 = registers      |
+    +--------------------------------------+
+            |
+            v
+    +--------------------------------------+
+    | 2. Pick next thread from ready_q     |
+    |                                      |
+    |    ready_q:                          |
+    |    [Thread B] -> [Thread C] -> NULL  |
+    |                                      |
+    |    next = dequeue(ready_q)           |
+    |    enqueue(ready_q, cur)  (if alive) |
+    +--------------------------------------+
+            |
+            v
+    +--------------------------------------+
+    | 3. Switch address space              |
+    |    Set TTBR0 = next->l1_pt           |
+    |    Flush TLB                         |
+    |    DSB / ISB barriers                |
+    +--------------------------------------+
+            |
+            v
+    +--------------------------------------+
+    | 4. Set TLS base                      |
+    |    Write next->tls_base to           |
+    |    CP15 c13 (TPIDRURW)               |
+    +--------------------------------------+
+            |
+            v
+    +--------------------------------------+
+    | 5. Restore next thread context       |
+    |    SP   = next->ctx.sp               |
+    |    LR   = next->ctx.lr               |
+    |    CPSR = next->ctx.cpsr             |
+    |    R0..R12 = next->ctx.r0..r12       |
+    +--------------------------------------+
+            |
+            v
+    +--------------------------------------+
+    | 6. Return to next thread             |
+    |    If CPSR says User mode:           |
+    |      auto_generic_return()           |
+    |    If CPSR says SVC mode:            |
+    |      svc_generic_return()            |
+    +--------------------------------------+
+            |
+            v
+    Next thread resumes execution
+    (either in user or kernel mode)
+
+
+  ========================================================================
+        SAVED CONTEXT STRUCTURE
+  ========================================================================
+
+    saved_context_t
+    +---------------------------+  offset
+    |  R0                       |    0
+    |  R1                       |    4
+    |  R2                       |    8
+    |  R3                       |   12
+    |  R4                       |   16
+    |  R5                       |   20
+    |  R6                       |   24
+    |  R7                       |   28
+    |  R8                       |   32
+    |  R9                       |   36
+    |  R10                      |   40
+    |  R11 (FP)                 |   44
+    |  R12 (IP)                 |   48
+    |  SP  (R13)                |   52
+    |  LR  (R14)                |   56
+    |  PC  (R15)                |   60
+    |  CPSR                     |   64
+    +---------------------------+
+
+    CPSR bits used:
+    +---+---+---+---+---+------+-------+
+    | N | Z | C | V | Q | ...  | Mode  |
+    +---+---+---+---+---+------+-------+
+                                  |
+                    0x10 = User mode
+                    0x13 = SVC mode
+                    0x12 = IRQ mode
+
+
+  ========================================================================
+        FULL LIFECYCLE: USER -> KERNEL -> SCHEDULE -> USER
+  ========================================================================
+
+    Thread A (running)              Thread B (ready)
+    ==================              ================
+
+    [executing user code]           [waiting in ready_q]
+           |
+           | Timer IRQ fires!
+           v
+    +------------------+
+    | Save Thread A    |
+    | context to PCB   |
+    +------------------+
+           |
+           v
+    +------------------+
+    | IRQ handler      |
+    | -> timer tick    |
+    | -> cs_do_sched() |
+    +------------------+
+           |
+           v
+    +------------------+
+    | Enqueue A to     |            +------------------+
+    | ready_q          |            | Dequeue B from   |
+    +------------------+            | ready_q          |
+                                    +------------------+
+                                           |
+                                           v
+                                    +------------------+
+                                    | Switch to B's    |
+                                    | page table       |
+                                    +------------------+
+                                           |
+                                           v
+                                    +------------------+
+                                    | Restore Thread B |
+                                    | context from PCB |
+                                    +------------------+
+                                           |
+                                           v
+                                    [Thread B resumes
+                                     user code]
+
+    Thread A sleeps in ready_q
+    until it's dequeued on a
+    future timer tick.
+
