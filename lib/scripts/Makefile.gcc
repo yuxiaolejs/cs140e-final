@@ -1,0 +1,16 @@
+CC := arm-none-eabi-gcc
+
+LIB_I := $(abspath ${DMODE_ROOT}/lib/include)
+
+# Borrowed from staff code
+CFLAGS ?=
+CFLAGS += -O -Wall -std=gnu99 -Wno-unused-variable # -Werror
+CFLAGS += -nostdlib -nostartfiles -ffreestanding 
+CFLAGS += -mcpu=arm1176jzf-s
+CFLAGS += -mno-unaligned-access
+CFLAGS += -I$(LIB_I)
+# end borrowed from staff code
+
+%.o: %.c
+	@printf "\033[32mCompiling %s...\033[0m\n" "$(abspath $@)"
+	$(CC) $(CFLAGS) -c $< -o $@
