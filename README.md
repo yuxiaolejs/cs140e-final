@@ -1,2 +1,2 @@
 # Final project for CS140E, Winter 2026 @ Stanford University
-Currently the code is extremely ugly and shaky... but it works! (mostly)
+A Linux-compatible operating system for Raspberry Pi Zero W (BCM2835), capable of compiling itself.
